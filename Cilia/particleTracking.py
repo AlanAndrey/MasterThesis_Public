@@ -10,6 +10,7 @@ import re
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 from .utils import detect_skipped_frames, get_sorted_tiff_files
+from .nd2_reader import ND2Reader, ND2Sequence
 
 def biggest_factors(x:int)->tuple:
     """
@@ -65,7 +66,7 @@ class ParticleTracker:
         tpdiag.performance_report()
         return self
 
-    def load(self, file_dir:str, format:str, fps:int)->'ParticleTracker':
+    def load(self, file_dir:str, format:str, fps:int=None)->'ParticleTracker':
         """
         Load a series of grayscale images from a directory
 
@@ -86,7 +87,8 @@ class ParticleTracker:
         True if loaded sucessfully, otherwise the exception is raised
         """
 
-        assert isinstance(fps, (int, float)), 'Invalid fps type, must be integer or float'
+        assert 'nd2' in format or isinstance(fps, (int, float)), 'Invalid fps type, must be integer or float'
+        self.FPS = fps
         # check if a single file is loaded or many
         if '*' in format:
             # detect skipped frames
@@ -97,11 +99,17 @@ class ParticleTracker:
             images = get_sorted_tiff_files(file_dir, get_nr)
 
             self.frames = pims.ImageSequence(images)
+        # custom loading for nd2 files, still in pims format but whole file is loaded
+        elif 'nd2' in format:
+            reader = ND2Reader(file_dir+'/'+format)
+            self.FPS = reader.get_fps()
+            self.mpp = reader.get_mpp()
+            self.frames = ND2Sequence(file_dir+'/'+format)
         else:
             self.frames = pims.TiffStack(file_dir+'/'+format)
         self.file_dir = file_dir
         self.shape = self.frames[0].shape
-        self.FPS = fps
+
         return self
 
     def __len__(self):
@@ -197,10 +205,14 @@ class ParticleTracker:
 
         mean_image /= len(self)
 
-        #create the pipeline function to subtract the mean and scale the values to 0-255
+        # dtype of image to rescale into
+        dtype = self.frames[0].dtype
+        range = np.iinfo(dtype).max
+
+        #create the pipeline function to subtract the mean and scale the values to 0 up to dtype max
         @pims.pipeline
         def subtract_mean_pil(image):
-            return (image - mean_image + min_value) / (max_value - min_value) * 255
+            return ((image - mean_image + min_value) / (max_value - min_value)* range).astype(dtype)
 
         self.frames = subtract_mean_pil(self.frames)
         return self
@@ -225,16 +237,20 @@ class ParticleTracker:
         # calculate the biggest two factors of the number of frames
         (a, b) = biggest_factors(len(frames_list))
 
+        dtype = self.frames[0].dtype
+        img_min = np.iinfo(dtype).min; img_max = np.iinfo(dtype).max
+
         # plot the frames
-        _, axs = plt.subplots(a, b, figsize=size)
+        fig, axs = plt.subplots(a, b, figsize=size)
         if type(axs) != np.ndarray:
             axs = np.array([axs])
         for i, ax in enumerate(axs.flat):
             if area is not None:
-                ax.imshow(self.frames[frames_list[i]][area[0][0]:area[0][1], area[1][0]:area[1][1]], cmap='gray', norm=Normalize(vmin=0, vmax=255))
+                im = ax.imshow(self.frames[frames_list[i]][area[0][0]:area[0][1], area[1][0]:area[1][1]], cmap='gray', norm=Normalize(vmin=0, vmax=255))
             else:
-                ax.imshow(self.frames[i], cmap='gray', norm=Normalize(vmin=0, vmax=255))
+                im = ax.imshow(self.frames[i], cmap='gray')
             ax.set(title=f'Frame {frames_list[i]%len(self)}')
+            cbar_ax = fig.colorbar(im, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
         plt.show()
         return self
 
@@ -402,6 +418,9 @@ class ParticleTracker:
         # set the frames per second if not set by the user
         if 'fps' not in tp_emsd_kwargs:
             tp_emsd_kwargs['fps'] = self.FPS
+            #overwrite the microns per pixel if present from nd2 file
+        if self.mpp is not None:
+            tp_emsd_kwargs['mpp'] = self.mpp
 
         # units of result are in seconds and microns
         self.emsd = tp.emsd(self.trajectory, **tp_emsd_kwargs, detail=True)
@@ -442,11 +461,6 @@ class ParticleTracker:
         # calculate the Fourier transform, note conversion between μm^2 and m^2
         fourier = np.fft.fft(self.emsd['msd']*1e-12)
         freq = np.fft.fftfreq(len(self.emsd['msd']), d=self.emsd['lagt'][2]-self.emsd['lagt'][1])
-
-        #######################################################################
-        # Warning! this is the wrong way to calculate a unilateral Fourier :) #
-        #######################################################################
-
         # cut negative frequencies and zero frequency
         idx = len(fourier)//2
         fourier = fourier[1:idx]
@@ -496,7 +510,8 @@ class ParticleTracker:
         show : bool, optional
             Whether to display the moduli. Defaults to False.
         """
-        assert self.results is not None, 'No Fourier transform calculated'
+        if self.results is None:
+            self.unilateral_fourier()
 
         K = sc.Boltzmann # m^2*kg*s^-2*K^-1
         PI = sc.pi
