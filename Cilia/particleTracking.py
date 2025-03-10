@@ -5,11 +5,12 @@ import pandas as pd
 import trackpy as tp
 import trackpy.diag as tpdiag
 import scipy.constants as sc
+from scipy.special import gamma
 import re
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
-from .utils import detect_skipped_frames, get_sorted_tiff_files
+from .utils import detect_skipped_frames, get_sorted_tiff_files, emsd
 from .nd2_reader import ND2Reader, ND2Sequence
 
 def biggest_factors(x:int)->tuple:
@@ -49,6 +50,7 @@ class ParticleTracker:
         self.emsd = None # the DataFrame of the mean squared displacement
         self.results = None # table of all frequency dependent results
         self.FPS = None # the frames per second of the video
+        self.mpp = None
         tp.quiet() # suppress trackpy warnings
 
     def enable_tp_warnings(self)->'ParticleTracker':
@@ -115,6 +117,10 @@ class ParticleTracker:
     def __len__(self):
         return self.frames.__len__()
 
+    # enable fram grab via array index
+    def __getitem__(self, key):
+        return self.frames[key]
+
     def crop(self, x:tuple, y:tuple)->'ParticleTracker':
         """
         Crop the video to a specific region
@@ -129,8 +135,8 @@ class ParticleTracker:
         assert self.frames is not None, 'No frames loaded'
         assert x[0] < x[1], 'Invalid x coordinates'
         assert y[0] < y[1], 'Invalid y coordinates'
-        assert x[1] < self.shape[1], 'x coordinates out of range'
-        assert y[1] < self.shape[0], 'y coordinates out of range'
+        assert x[1] <= self.shape[0], 'x coordinates out of range'
+        assert y[1] <= self.shape[1], 'y coordinates out of range'
 
         x_new = self.shape[0]-x[1]
         y_new = self.shape[1]-y[1]
@@ -186,6 +192,40 @@ class ParticleTracker:
         self.frames = invert(self.frames)
         return self
 
+    def transpose(self):
+        """
+        Transpose the frames
+        """
+        assert self.frames is not None, 'No frames loaded'
+
+        @pims.pipeline
+        def transpose(image):
+            return image.T
+
+        self.frames = transpose(self.frames)
+        return self
+
+    def scale_full(self):
+        """
+        Scale the frames to the full range of the datatype
+        """
+        assert self.frames is not None, 'No frames loaded'
+
+        _min, _max = np.inf, -np.inf
+        for frame in self.frames:
+            _min = np.minimum(_min, frame.min())
+            _max = np.maximum(_max, frame.max())
+
+        dtype = self.frames[0].dtype
+        _range = np.iinfo(dtype).max
+
+        @pims.pipeline
+        def scale(image):
+            return ((image - _min) / (_max - _min) * _range).astype(dtype)
+
+        self.frames = scale(self.frames)
+        return self
+
     def subtract_mean(self):
         """
         Subtract the mean image from all images. This is implemented as a additional
@@ -207,12 +247,12 @@ class ParticleTracker:
 
         # dtype of image to rescale into
         dtype = self.frames[0].dtype
-        range = np.iinfo(dtype).max
+        _range = np.iinfo(dtype).max
 
         #create the pipeline function to subtract the mean and scale the values to 0 up to dtype max
         @pims.pipeline
         def subtract_mean_pil(image):
-            return ((image - mean_image + min_value) / (max_value - min_value)* range).astype(dtype)
+            return ((image - mean_image + min_value) / (max_value - min_value)* _range).astype(dtype)
 
         self.frames = subtract_mean_pil(self.frames)
         return self
@@ -232,17 +272,14 @@ class ParticleTracker:
         """
         assert self.frames is not None, 'No frames loaded'
         assert max(frames_list) < len(self.frames), 'Frame number out of range'
-        assert area is None or type(area) == tuple, 'Invalid area'
+        assert area is None or isinstance(area, tuple), 'Invalid area'
 
         # calculate the biggest two factors of the number of frames
         (a, b) = biggest_factors(len(frames_list))
 
-        dtype = self.frames[0].dtype
-        img_min = np.iinfo(dtype).min; img_max = np.iinfo(dtype).max
-
         # plot the frames
         fig, axs = plt.subplots(a, b, figsize=size)
-        if type(axs) != np.ndarray:
+        if isinstance(axs, np.ndarray):
             axs = np.array([axs])
         for i, ax in enumerate(axs.flat):
             if area is not None:
@@ -250,7 +287,7 @@ class ParticleTracker:
             else:
                 im = ax.imshow(self.frames[i], cmap='gray')
             ax.set(title=f'Frame {frames_list[i]%len(self)}')
-            cbar_ax = fig.colorbar(im, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
+            _ = fig.colorbar(im, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
         plt.show()
         return self
 
@@ -314,8 +351,44 @@ class ParticleTracker:
         plt.show()
         return self
 
+    def __reset_index__(self, df):
+        """
+        Sanitized the DataFrame which is returned by various trackpy functions
+        """
+        if isinstance(df.index, pd.RangeIndex):
+            df = df.copy()
+            df = df.drop(columns=[i for i in df.index.names if i in df.columns])
+            df = df.reset_index()
+        return df
+
+    def __update_weights__(self, df):
+        """
+        Update the weights of the trajectorys based on the number of frames a particle is tracked
+        Parameters
+        ----------
+        df : pd.DataFrame
+            The DataFrame of the trajectorys
+        """
+        assert df is not None, 'No trajectorys assembled'
+
+        # drop all columns exc ept particle and frame
+        df = df.drop(columns=[col for col in df.columns if col not in ['particle']])
+
+        # need to sanitize input since trackpy creates multilevel indexing sometimes
+        frame_particle_df = self.__reset_index__(df)
+
+        # get the duration of each trajectory
+        grouped = frame_particle_df.groupby('particle')
+        durations = grouped['frame'].max() - grouped['frame'].min()
+
+        # get weights for the trajectorys timesteps
+        weights = np.zeros(durations.max() + 1)
+        for duration in durations:
+            weights[:duration + 1] += 1
+        self.weights = weights
+
     def assemble_tracks(self, tp_locate_kwargs:dict, tp_link_kwargs:dict,
-                        stub_treshold:int, show=False)->'ParticleTracker':
+                stub_treshold:int, show=False)->'ParticleTracker':
         """
         Tracks particles throughout all frames and links them using trackpy
 
@@ -376,7 +449,8 @@ class ParticleTracker:
         # compute the drift
         drift = tp.compute_drift(self.trajectory)
         # subtract the drift
-        self.trajectory = tp.subtract_drift(self.trajectory.copy(), drift)
+        self.trajectory = tp.subtract_drift(self.trajectory, drift)
+
         if show:
             self.show_drift(drift)
         return self
@@ -399,7 +473,7 @@ class ParticleTracker:
         ax.legend()
         plt.show()
 
-    def calculate_msd(self, tp_emsd_kwargs:dict, show=False)->'ParticleTracker':
+    def calculate_msd(self, tp_emsd_kwargs:dict, percentile=50, show=False)->'ParticleTracker':
         """
         Calculate the mean squared displacement of the linked trajectorys using
         trackpys emsd function
@@ -410,6 +484,9 @@ class ParticleTracker:
             Dict of all kwargs supported by trackpy.emsd, see
 
             http://soft-matter.github.io/trackpy/v0.3.0/generated/trackpy.emsd.html
+        percentile: float, optional
+            The length of the msd kept for further processing in percent. Defaults to 100.
+            This length is determined by the number of particles tracked for each timestep
         show : bool, optional
             Whether to display the MSD plot. Defaults to False.
         """
@@ -423,7 +500,25 @@ class ParticleTracker:
             tp_emsd_kwargs['mpp'] = self.mpp
 
         # units of result are in seconds and microns
-        self.emsd = tp.emsd(self.trajectory, **tp_emsd_kwargs, detail=True)
+        self.trajectory = self.__reset_index__(self.trajectory)
+
+        _emsd = emsd(self.trajectory, **tp_emsd_kwargs, detail=True)
+
+        # update the weights of the trajectorys
+        self.__update_weights__(self.trajectory.set_index('frame'))
+
+        # cut the percentile of the msd
+        _max = self.weights[0]
+        _min = self.weights[-1]
+        cut = _max*(100-percentile)/100
+        if cut < _min:
+            cut = _min
+        idx = np.nonzero(self.weights >= cut)[0][-1]
+
+        # cut emsd and weights
+        self.emsd = _emsd.iloc[:idx]
+        self.weights = self.weights[:idx]
+
 
         if show:
             self.show_msd()
@@ -441,13 +536,16 @@ class ParticleTracker:
         assert self.emsd is not None, 'No MSD calculated'
 
         _, ax = plt.subplots(1, 1, figsize=size)
-        ax.plot(self.emsd['lagt'], self.emsd['msd'], 'k')
+        ax.scatter(self.emsd['lagt'], self.emsd['msd'], s=2, c='k')
         ax.set(xlabel='lag time [s]', ylabel=r'$\langle \Delta r^2 \rangle [\mu m^2]$',
                title='Mean Squared Displacement')
+        ax.fill_between(self.emsd['lagt'], self.emsd['msd'] - 0.1*self.emsd['std'],
+                        self.emsd['msd'] + 0.1*self.emsd['std'], alpha=0.5, color='r', label=r'$0.1\sigma$')
+        ax.legend(loc='upper left')
         plt.show()
         return self
 
-    def unilateral_fourier(self, show=False)->'ParticleTracker':
+    def __unilateral_fourier__(self, show=False)->'ParticleTracker':
         """
         Calculate the unilateral Fourier transform of the msd
 
@@ -467,11 +565,13 @@ class ParticleTracker:
         freq = freq[1:idx]
 
         # assemble the results table
-        self.results = pd.DataFrame({'freq [Hz]': freq, 'F(msd) [m*s]': fourier})
+        if self.results is None:
+            self.results = pd.DataFrame({'freq [Hz]': freq, 'F(msd) [m*s]': fourier})
+        else:
+            self.results['F(msd) [m*s]'] = fourier
 
         if show:
             self.show_fourier()
-        return self
 
     def show_fourier(self, size=(5,5))->'ParticleTracker':
         """
@@ -496,7 +596,73 @@ class ParticleTracker:
         plt.show()
         return self
 
-    def calculate_moduli(self, temperature, radius, show=False)->'ParticleTracker':
+    def __calculate_laplace__(self):
+        """
+        Calculate the laplace transform of the msd
+
+        Parameters
+        ----------
+        s : complex, optional
+            Frequency domain parameter s=σ+iω. Defaults to s=0+i.
+        show : bool, optional
+            Whether to display the laplace transform. Defaults to False.
+        """
+        assert self.emsd is not None, 'No msd calculated'
+
+        # create frequency domain
+        freq = np.fft.fftfreq(len(self.emsd['msd']), d=self.emsd['lagt'][2]-self.emsd['lagt'][1])
+        freq = freq[1:len(freq)//2]
+
+        msd = self.emsd['msd'].to_numpy()*1e-12 # convert to m^2
+        lagt = self.emsd['lagt'].to_numpy()
+
+        # calculate the laplace transform of the msd
+        def single_laplace(s):
+            # use the trapezoidal rule to calculate the integral
+            # F(s) ≈ Δt/2 * [f(0) + 2 * Σ_{n=1}^{N-1} f(n*Δt) * e^{-s*n*Δt} + f(N*Δt) * e^{-s*N*Δt}]
+            res = (lagt[1]-lagt[0])/2 * (msd[0] + 2*np.sum([msd[i] * np.exp(-s*lagt[i]) for i in range(1,len(lagt)-1)]) + msd[-1]*np.exp(-s*lagt[-1]))
+            return res
+
+        laplace = np.array([single_laplace(0+1j*s) for s in freq])
+
+        # assemble the results table
+        if self.results is None:
+            self.results = pd.DataFrame({'freq [Hz]': freq, 'L(msd) [m*s]': laplace})
+        else:
+            self.results['L(msd) [m*s]'] = laplace
+
+    def __calculate_polyfit_laplace__(self, coeffs):
+        """
+        Calculate the laplace transform of a polynomial fit of the msd
+
+        Parameters
+        ----------
+        coeffs : np.array
+            The coefficients of the polynomial fit of the msd
+        s : complex, optional
+            Frequency domain parameter s=σ+iω. Defaults to s=0+i.
+        show : bool, optional
+            Whether to display the laplace transform. Defaults to False.
+        """
+        assert self.emsd is not None, 'No msd calculated'
+
+        # create frequency domain
+        freq = np.fft.fftfreq(len(self.emsd['msd']), d=self.emsd['lagt'][2]-self.emsd['lagt'][1])
+        freq = freq[1:len(freq)//2]
+
+        # calculate the laplace transform of the polynomial fit
+        def single_laplace(s):
+            return np.sum([coeffs[i] * math.factorial(i) / s**(i+1) for i in range(len(coeffs))])
+
+        laplace = np.array([single_laplace(0+1j*s) for s in freq])
+        # assemble the results table
+        if self.results is None:
+            self.results = pd.DataFrame({'freq [Hz]': freq, 'L(poly(msd)) [m*s]': laplace})
+        else:
+            self.results['L(poly(msd)) [m*s]'] = laplace
+
+
+    def calculate_moduli(self, temperature, radius, modus='viscoelastic', show=False)->'ParticleTracker':
         """
         Calculate the complex, viscous and elastic modulus from the fourier
         transformed msd.
@@ -507,32 +673,115 @@ class ParticleTracker:
             The temperature of the fluid in Kelvin
         radius : float
             The radius of the particles in meters
+        modus : str, optional
+            Either visocelastic per default o viscous for purely viscous fluids.
         show : bool, optional
             Whether to display the moduli. Defaults to False.
         """
-        if self.results is None:
-            self.unilateral_fourier()
+        assert modus in ['viscoelastic', 'viscous', 'laplace', 'powerlaw'] or  'poly_laplace' in modus, 'Invalid modus'
+
 
         K = sc.Boltzmann # m^2*kg*s^-2*K^-1
         PI = sc.pi
-        # calculate the complex moduli
-        # units: Pa or kg*m^-1*s^-2
-        g =2*K*temperature / (3*PI*radius * 1j * self.results['freq [Hz]'] * self.results['F(msd) [m*s]'])
-        # calculate the viscous and elastic moduli
-        g_el = np.abs(np.real(g)) # Pa
-        g_vis = np.abs(np.imag(g)) # Pa
 
-        # append the results to the moduli results table
-        self.old_moduli = pd.DataFrame({'freq [Hz]': self.results['freq [Hz]'],
-                                            'G* [Pa]': g,
-                                            'G\' [Pa]': g_el,
-                                            'G\" [Pa]': g_vis})
+        # viscoelastic moduli
+        if modus == 'viscoelastic':
+            self.__unilateral_fourier__()
 
-        if show:
-            self.show_moduli()
+            # calculate the complex moduli
+            # units: Pa or kg*m^-1*s^-2
+            g = 2*K*temperature / (3*PI*radius * 1j * self.results['freq [Hz]'] * self.results['F(msd) [m*s]'])
+            # calculate the viscous and elastic moduli
+            g_el = np.abs(np.real(g)) # Pa
+            g_vis = np.abs(np.imag(g)) # Pa
+
+            # append the results to the moduli results table
+            self.moduli = pd.DataFrame({'freq [Hz]': self.results['freq [Hz]'],
+                                        'G* [Pa]': g,
+                                        'G\' [Pa]': g_el,
+                                        'G\" [Pa]': g_vis})
+            if show:
+                self.show_moduli(scale='linear')
+
+        # purely viscous modulus
+        elif modus == 'viscous':
+            # create linear fit of the msd
+            fit, [_, _, _, _] = np.polynomial.polynomial.polyfit(self.emsd['lagt'], self.emsd['msd'], 1, w=self.weights, full=True)
+            # fit[0] = offset [dr^2], fit[1] = dr/t [um^2/t]
+            # calculate the viscous modulus using the t/dr relation
+            n = 2 * K * temperature / (3 * PI * radius) / fit[1] * 1e12 # Pa*s
+
+            print(f'Viscous Modulus: {n} Pa*s')
+
+        elif modus == 'laplace':
+            # first create laplace transform of the msd
+            self.__calculate_laplace__()
+
+            # calculatet the complex moduli
+            g = 2*K*temperature / (3*PI*radius * 1j * self.results['freq [Hz]'] * self.results['L(msd) [m*s]'])
+            g_el = np.abs(np.real(g)) # Pa
+            g_vis = np.abs(np.imag(g)) # Pa
+
+            self.moduli = pd.DataFrame({'freq [Hz]': self.results['freq [Hz]'],
+                                        'G* [Pa]': g,
+                                        'G\' [Pa]': g_el,
+                                        'G\" [Pa]': g_vis})
+            if show:
+                self.show_moduli()
+
+        elif 'poly_laplace' in modus:
+            # extract degree of polynomial as only number in string
+            deg = int(re.findall(r'\d+', modus)[0])
+            # create a polynomial fit of the msd
+            fit, [_, _, _, _] = np.polynomial.polynomial.polyfit(self.emsd['lagt'], self.emsd['msd']*1e-12, deg, w=self.weights, full=True)
+
+            # next calculate the analytical laplace transform of the polynomial:
+            self.__calculate_polyfit_laplace__(fit)
+            g = 2*K*temperature / (3*PI*radius * 1j * self.results['freq [Hz]'] * self.results['L(poly(msd)) [m*s]'])
+            g_el = np.abs(np.real(g)) # Pa
+            g_vis = np.abs(np.imag(g)) # Pa
+
+            self.moduli = pd.DataFrame({'freq [Hz]': self.results['freq [Hz]'],
+                                        'G* [Pa]': g,
+                                        'G\' [Pa]': g_el,
+                                        'G\" [Pa]': g_vis})
+            if show:
+                self.show_moduli()
+
+        elif modus == 'powerlaw':
+            # create a rolling powerlaf fit of the msd MSD = A * (t/t_0)^alpha(t_0)
+            # in order to extract alpha we only need to fit the slope of the log log plot
+
+            window_size = 7 # the number of points to consider for each fit on the log log plot, crop at the edges
+            log_msd = np.log(self.emsd['msd'])
+            log_lagt = np.log(self.emsd['lagt'])
+            alpha = np.zeros(len(log_msd))
+            for t_0 in range(len(log_msd)):
+                idx = t_0 - window_size//2
+                if idx < 0:
+                    idx = 0
+                if idx + window_size > len(log_msd):
+                    idx = len(log_msd) - window_size
+                fit = np.polyfit(log_lagt[idx:idx+window_size], log_msd[idx:idx+window_size], 1, w=self.weights[idx:idx+window_size])
+                alpha[t_0] = fit[0]
+
+            # calculate the complex moduli
+            prefactor = 2 * K * temperature / (3 * PI * radius)
+            g = prefactor / (self.emsd['msd'].to_numpy()*1e-12 * np.array(gamma(1 + alpha)))
+            g_el = g * np.cos(PI/2 * alpha)
+            g_vis = g * np.sin(PI/2 * alpha)
+
+            self.moduli = pd.DataFrame({'freq [Hz]': 1/self.emsd['lagt'],
+                                        'G* [Pa]': g,
+                                        'G\' [Pa]': g_el,
+                                        'G\" [Pa]': g_vis})
+            if show:
+                self.show_moduli()
+
+
         return self
 
-    def show_moduli(self, size=(5,5))->'ParticleTracker':
+    def show_moduli(self, size=(5,5), scale='log')->'ParticleTracker':
         """
         Display the viscous and elastic moduli
 
@@ -544,52 +793,10 @@ class ParticleTracker:
         assert self.results is not None, 'No moduli calculated'
 
         _, ax = plt.subplots(1, 1, figsize=size)
-        ax.scatter(self.old_moduli['freq [Hz]'], self.old_moduli['G\' [Pa]'], s=1, label='G\'')
-        ax.scatter(self.old_moduli['freq [Hz]'], self.old_moduli['G\" [Pa]'], s=1, label='G\"')
+        ax.scatter(self.moduli['freq [Hz]'], self.moduli['G\' [Pa]'], s=1, label='G\'')
+        ax.scatter(self.moduli['freq [Hz]'], self.moduli['G\" [Pa]'], s=1, label='G\"')
         ax.set(xlabel='frequency [Hz]', ylabel='Modulus [Pa]',
-               title='Viscous & Elastic Modulus', yscale='log')
+               title='Viscous & Elastic Modulus', yscale='log', xscale=scale)
         ax.legend()
         plt.show()
         return self
-
-    def calculate_moduli_new(self, temperature, radius, show=False, freq_range=None)->'ParticleTracker':
-        """
-        Calculate the complex, viscous and elastic modulus using an algebraic stokes
-        einstein equation, as described in:
-        Particle Tracking Microrheology of Complex Fluids
-        https://doi.org/10.1103/PhysRevLett.79.3282
-
-        Parameters
-        ----------
-        temperature : float
-            The temperature of the fluid in Kelvin
-        radius : float
-            The radius of the particles in meters
-        show : bool, optional
-            Whether to display the moduli. Defaults to False.
-        freq_range : tuple, optional
-            The frequency range to calculate the moduli for. If None, the whole range is used,
-            otherwise the range is cut to values in between the tuple. Defaults to None.
-        """
-        assert self.emsd is not None, 'No msd calculated'
-
-        # first estimate the derivative of the log of the mds with regard to the
-        # log of the lag time by a central differences scheme and euler scheme at the borders
-        ln_msd = np.log(self.emsd['msd'].to_numpy())
-        dt = self.emsd['lagt'].to_numpy()
-
-        dln_msd = np.zeros(ln_msd.shape[0])
-
-        # use the fact that d ln(x(t)) / d ln(t) = (d ln(x(t)) / dt) * (dt / d ln(t))
-
-        dln_msd[1:-1] = (ln_msd[2:] - ln_msd[:-2]) / (dt[2:] - dt[:-2])
-        dln_msd[0] = (ln_msd[1] - ln_msd[0]) / (dt[1] - dt[0])
-        dln_msd[-1] = (ln_msd[-1] - ln_msd[-2]) / (dt[-1] - dt[-2])
-
-        # multiply by dt / d ln(t)
-
-        dln_msd = dln_msd * dt
-
-        fig, ax = plt.subplots(1, 1, figsize=(5,5))
-        ax.scatter(self.emsd['lagt'], dln_msd, s=1)
-        ax.set(xscale='log', ylim=[-2,2])
