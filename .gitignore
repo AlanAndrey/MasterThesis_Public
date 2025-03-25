@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+#folder data and zip
+
+data.zip
+
 #custom
 *.tiff
 *.tif

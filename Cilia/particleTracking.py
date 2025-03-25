@@ -5,6 +5,7 @@ import pandas as pd
 import trackpy as tp
 import trackpy.diag as tpdiag
 import scipy.constants as sc
+from scipy.ndimage import gaussian_filter1d
 from scipy.special import gamma
 import re
 
@@ -51,6 +52,7 @@ class ParticleTracker:
         self.results = None # table of all frequency dependent results
         self.FPS = None # the frames per second of the video
         self.mpp = None
+        self.name = None
         tp.quiet() # suppress trackpy warnings
 
     def enable_tp_warnings(self)->'ParticleTracker':
@@ -111,6 +113,8 @@ class ParticleTracker:
             self.frames = pims.TiffStack(file_dir+'/'+format)
         self.file_dir = file_dir
         self.shape = self.frames[0].shape
+
+        self.name = format.split('.')[0]
 
         return self
 
@@ -211,17 +215,17 @@ class ParticleTracker:
         """
         assert self.frames is not None, 'No frames loaded'
 
-        _min, _max = np.inf, -np.inf
+        min, max = np.inf, -np.inf
         for frame in self.frames:
-            _min = np.minimum(_min, frame.min())
-            _max = np.maximum(_max, frame.max())
+            min = np.minimum(min, frame.min())
+            max = np.maximum(max, frame.max())
 
         dtype = self.frames[0].dtype
         _range = np.iinfo(dtype).max
 
         @pims.pipeline
         def scale(image):
-            return ((image - _min) / (_max - _min) * _range).astype(dtype)
+            return ((image - min) / (max - min) * _range).astype(dtype)
 
         self.frames = scale(self.frames)
         return self
@@ -257,6 +261,42 @@ class ParticleTracker:
         self.frames = subtract_mean_pil(self.frames)
         return self
 
+    def intensity_clipping(self, min, max):
+        """
+        Clip the values of the frames to a specific range to enhance contrast
+        may be used in combination with the scale_full function
+
+        Parameters
+        ----------
+        min : int
+            The minimum value to rescale the frames to
+        max : int
+            The maximum value to rescale the frames to
+        """
+        dtype = self.frames[0].dtype
+
+        @pims.pipeline
+        def clip(image):
+            return np.clip(image, min, max).astype(dtype)
+
+        self.frames = clip(self.frames)
+        return self
+
+    def show_frame_intensity(self, frame:int, size=(10, 5))->'ParticleTracker':
+        """
+        Display the number of pixels with a given intensity in a specific frame
+        """
+        im = self.frames[frame].flatten()
+
+        _, (ax1, ax2) = plt.subplots(1,2, figsize=size)
+        ax1.imshow(self.frames[frame], cmap='gray', norm=Normalize(vmin=0, vmax=255))
+        ax2.hist(im, bins=256, color='k')
+        ax2.set(xlabel='intensity', ylabel='count',yscale='log',
+               xlim=(0,256), title=f'Frame {frame%len(self)}')
+        plt.show()
+        return self
+
+
     def show_frame(self, frames_list, size=(10,10), area=None)->'ParticleTracker':
         """
         Display frames from a list in a grid layout.
@@ -272,22 +312,26 @@ class ParticleTracker:
         """
         assert self.frames is not None, 'No frames loaded'
         assert max(frames_list) < len(self.frames), 'Frame number out of range'
-        assert area is None or isinstance(area, tuple), 'Invalid area'
+        assert area is None or type(area) == tuple, 'Invalid area'
 
         # calculate the biggest two factors of the number of frames
         (a, b) = biggest_factors(len(frames_list))
 
+        dtype = self.frames[0].dtype
+        img_min = np.iinfo(dtype).min; img_max = np.iinfo(dtype).max
+
         # plot the frames
         fig, axs = plt.subplots(a, b, figsize=size)
-        if isinstance(axs, np.ndarray):
+        if type(axs) != np.ndarray:
             axs = np.array([axs])
         for i, ax in enumerate(axs.flat):
             if area is not None:
-                im = ax.imshow(self.frames[frames_list[i]][area[0][0]:area[0][1], area[1][0]:area[1][1]], cmap='gray', norm=Normalize(vmin=0, vmax=255))
+                im = ax.imshow(self.frames[frames_list[i]][area[0][0]:area[0][1], area[1][0]:area[1][1]],
+                               cmap='gray', norm=Normalize(vmin=0, vmax=255))
             else:
-                im = ax.imshow(self.frames[i], cmap='gray')
+                im = ax.imshow(self.frames[i], cmap='gray', norm=Normalize(vmin=0, vmax=255))
             ax.set(title=f'Frame {frames_list[i]%len(self)}')
-            _ = fig.colorbar(im, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
+            cbar_ax = fig.colorbar(im, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04)
         plt.show()
         return self
 
@@ -340,7 +384,7 @@ class ParticleTracker:
                    c='none', edgecolors='r')
         axes['a'].set(title=f'Frame {frame%len(self)}')
         # histogramm of the particle masses
-        axes['b'].hist(particles['raw_mass'], bins=50)
+        axes['b'].hist(particles['mass'], bins=100)
         axes['b'].set(xlabel='mass', ylabel='count')
         # histogram of the particle sizes
         axes['c'].hist(particles['size'], bins=50)
@@ -355,13 +399,13 @@ class ParticleTracker:
         """
         Sanitized the DataFrame which is returned by various trackpy functions
         """
-        if isinstance(df.index, pd.RangeIndex):
+        if type(df.index) != pd.RangeIndex:
             df = df.copy()
             df = df.drop(columns=[i for i in df.index.names if i in df.columns])
             df = df.reset_index()
         return df
 
-    def __update_weights__(self, df):
+    def _update_weights(self, df):
         """
         Update the weights of the trajectorys based on the number of frames a particle is tracked
         Parameters
@@ -414,6 +458,7 @@ class ParticleTracker:
         # track particles using trackpy
         self.tracks = tp.batch(self.frames, **tp_locate_kwargs)
         self.trajectory = tp.link_df(self.tracks, **tp_link_kwargs)
+
         self.trajectory = tp.filter_stubs(self.trajectory, stub_treshold)
 
         if show:
@@ -505,26 +550,25 @@ class ParticleTracker:
         _emsd = emsd(self.trajectory, **tp_emsd_kwargs, detail=True)
 
         # update the weights of the trajectorys
-        self.__update_weights__(self.trajectory.set_index('frame'))
+        self._update_weights(self.trajectory.set_index('frame'))
 
         # cut the percentile of the msd
-        _max = self.weights[0]
-        _min = self.weights[-1]
-        cut = _max*(100-percentile)/100
-        if cut < _min:
-            cut = _min
-        idx = np.nonzero(self.weights >= cut)[0][-1]
+        max = self.weights[0]
+        min = self.weights[-1]
+        cut = max*(100-percentile)/100
+        if cut < min:
+            cut = min
+        idx = np.where(self.weights >= cut)[0][-1]
 
         # cut emsd and weights
         self.emsd = _emsd.iloc[:idx]
         self.weights = self.weights[:idx]
 
-
         if show:
             self.show_msd()
         return self
 
-    def show_msd(self, size=(5,5))->'ParticleTracker':
+    def show_msd(self, smooth=False, size=(5,5))->'ParticleTracker':
         """
         Display the mean squared displacement
 
@@ -536,7 +580,10 @@ class ParticleTracker:
         assert self.emsd is not None, 'No MSD calculated'
 
         _, ax = plt.subplots(1, 1, figsize=size)
-        ax.scatter(self.emsd['lagt'], self.emsd['msd'], s=2, c='k')
+        if smooth:
+            ax.scatter(self.emsd['lagt'], self.emsd['msd-smooth'], s=2, c='k')
+        else:
+            ax.scatter(self.emsd['lagt'], self.emsd['msd'], s=2, c='k')
         ax.set(xlabel='lag time [s]', ylabel=r'$\langle \Delta r^2 \rangle [\mu m^2]$',
                title='Mean Squared Displacement')
         ax.fill_between(self.emsd['lagt'], self.emsd['msd'] - 0.1*self.emsd['std'],
@@ -545,7 +592,7 @@ class ParticleTracker:
         plt.show()
         return self
 
-    def __unilateral_fourier__(self, show=False)->'ParticleTracker':
+    def _unilateral_fourier(self, smooth=False, show=False)->'ParticleTracker':
         """
         Calculate the unilateral Fourier transform of the msd
 
@@ -557,12 +604,16 @@ class ParticleTracker:
         assert self.emsd is not None, 'No msd calculated jet'
 
         # calculate the Fourier transform, note conversion between μm^2 and m^2
-        fourier = np.fft.fft(self.emsd['msd']*1e-12)
+        if smooth:
+            fourier = np.fft.fft(self.emsd['msd-smooth']*1e-12)
+        else:
+            fourier = np.fft.fft(self.emsd['msd']*1e-12)
         freq = np.fft.fftfreq(len(self.emsd['msd']), d=self.emsd['lagt'][2]-self.emsd['lagt'][1])
         # cut negative frequencies and zero frequency
         idx = len(fourier)//2
         fourier = fourier[1:idx]
         freq = freq[1:idx]
+
 
         # assemble the results table
         if self.results is None:
@@ -596,7 +647,7 @@ class ParticleTracker:
         plt.show()
         return self
 
-    def __calculate_laplace__(self):
+    def _calculate_laplace(self):
         """
         Calculate the laplace transform of the msd
 
@@ -631,7 +682,7 @@ class ParticleTracker:
         else:
             self.results['L(msd) [m*s]'] = laplace
 
-    def __calculate_polyfit_laplace__(self, coeffs):
+    def _calculate_polyfit_laplace(self, coeffs):
         """
         Calculate the laplace transform of a polynomial fit of the msd
 
@@ -678,7 +729,7 @@ class ParticleTracker:
         show : bool, optional
             Whether to display the moduli. Defaults to False.
         """
-        assert modus in ['viscoelastic', 'viscous', 'laplace', 'powerlaw'] or  'poly_laplace' in modus, 'Invalid modus'
+        assert modus in ['viscoelastic', 'viscous', 'laplace', 'powerlaw', 'smooth'] or  'poly_laplace' in modus, 'Invalid modus'
 
 
         K = sc.Boltzmann # m^2*kg*s^-2*K^-1
@@ -686,14 +737,14 @@ class ParticleTracker:
 
         # viscoelastic moduli
         if modus == 'viscoelastic':
-            self.__unilateral_fourier__()
+            self._unilateral_fourier()
 
             # calculate the complex moduli
             # units: Pa or kg*m^-1*s^-2
             g = 2*K*temperature / (3*PI*radius * 1j * self.results['freq [Hz]'] * self.results['F(msd) [m*s]'])
             # calculate the viscous and elastic moduli
-            g_el = np.abs(np.real(g)) # Pa
-            g_vis = np.abs(np.imag(g)) # Pa
+            g_el = np.real(g) # Pa
+            g_vis = np.imag(g) # Pa
 
             # append the results to the moduli results table
             self.moduli = pd.DataFrame({'freq [Hz]': self.results['freq [Hz]'],
@@ -706,16 +757,16 @@ class ParticleTracker:
         # purely viscous modulus
         elif modus == 'viscous':
             # create linear fit of the msd
-            fit, [_, _, _, _] = np.polynomial.polynomial.polyfit(self.emsd['lagt'], self.emsd['msd'], 1, w=self.weights, full=True)
+            fit, [res, _, _, _] = np.polynomial.polynomial.polyfit(self.emsd['lagt'], self.emsd['msd'], 1, w=self.weights, full=True)
             # fit[0] = offset [dr^2], fit[1] = dr/t [um^2/t]
             # calculate the viscous modulus using the t/dr relation
             n = 2 * K * temperature / (3 * PI * radius) / fit[1] * 1e12 # Pa*s
 
-            print(f'Viscous Modulus: {n} Pa*s')
+            print(f'Viscous Modulus: {n*1e3} mPa*s')
 
         elif modus == 'laplace':
             # first create laplace transform of the msd
-            self.__calculate_laplace__()
+            self._calculate_laplace()
 
             # calculatet the complex moduli
             g = 2*K*temperature / (3*PI*radius * 1j * self.results['freq [Hz]'] * self.results['L(msd) [m*s]'])
@@ -733,10 +784,10 @@ class ParticleTracker:
             # extract degree of polynomial as only number in string
             deg = int(re.findall(r'\d+', modus)[0])
             # create a polynomial fit of the msd
-            fit, [_, _, _, _] = np.polynomial.polynomial.polyfit(self.emsd['lagt'], self.emsd['msd']*1e-12, deg, w=self.weights, full=True)
+            fit, [res, _, _, _] = np.polynomial.polynomial.polyfit(self.emsd['lagt'], self.emsd['msd']*1e-12, deg, w=self.weights, full=True)
 
             # next calculate the analytical laplace transform of the polynomial:
-            self.__calculate_polyfit_laplace__(fit)
+            self._calculate_polyfit_laplace(fit)
             g = 2*K*temperature / (3*PI*radius * 1j * self.results['freq [Hz]'] * self.results['L(poly(msd)) [m*s]'])
             g_el = np.abs(np.real(g)) # Pa
             g_vis = np.abs(np.imag(g)) # Pa
@@ -775,8 +826,27 @@ class ParticleTracker:
                                         'G* [Pa]': g,
                                         'G\' [Pa]': g_el,
                                         'G\" [Pa]': g_vis})
+        elif modus == 'smooth':
+            # calculate a smoothed out msd
+            self.emsd['msd-smooth'] = gaussian_filter1d(self.emsd['msd'], 20, mode='nearest')
+            self.show_msd(smooth=True)
+
+            self._unilateral_fourier(smooth=True)
+
+            # calculate the complex moduli
+            # units: Pa or kg*m^-1*s^-2
+            g = 2*K*temperature / (3*PI*radius * 1j * self.results['freq [Hz]'] * self.results['F(msd) [m*s]'])
+            # calculate the viscous and elastic moduli
+            g_el = np.real(g) # Pa
+            g_vis = np.imag(g) # Pa
+
+            # append the results to the moduli results table
+            self.moduli = pd.DataFrame({'freq [Hz]': self.results['freq [Hz]'],
+                                        'G* [Pa]': g,
+                                        'G\' [Pa]': g_el,
+                                        'G\" [Pa]': g_vis})
             if show:
-                self.show_moduli()
+                self.show_moduli(scale='linear')
 
 
         return self
@@ -796,7 +866,7 @@ class ParticleTracker:
         ax.scatter(self.moduli['freq [Hz]'], self.moduli['G\' [Pa]'], s=1, label='G\'')
         ax.scatter(self.moduli['freq [Hz]'], self.moduli['G\" [Pa]'], s=1, label='G\"')
         ax.set(xlabel='frequency [Hz]', ylabel='Modulus [Pa]',
-               title='Viscous & Elastic Modulus', yscale='log', xscale=scale)
+               title='Viscous & Elastic Modulus', yscale=scale, xscale=scale)
         ax.legend()
         plt.show()
         return self
