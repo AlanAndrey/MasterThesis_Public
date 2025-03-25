@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 
 #folder data and zip
-
+data/
 data.zip
 
 #custom
